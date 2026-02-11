@@ -19,19 +19,7 @@ import platform
 from prune_methods import PruneMethod
 from prune_flap import PruneFLAP
 
-# from caching_dummy import Caching
-# data_path = Caching.get_dataset_root(dataset_name, tokenizer=self.tokenizer, seqlen=self.model.seqlen, cache_base=self.cache_base)
-import importlib.util
-if not 'gcp' in platform.uname().node:
-    sys.path.append('/software/ais2t/bin/z1-dataset-caching')
-    spec = importlib.util.spec_from_file_location('Caching', '/software/ais2t/bin/z1-dataset-caching/Caching/__init__.py')
-else:
-    username = getpass.getuser()
-    sys.path.append(f'/scratch/htc/{username}/bin/z1-dataset-caching')
-    spec = importlib.util.spec_from_file_location('Caching', f'/scratch/htc/{username}/bin/z1-dataset-caching/Caching/__init__.py')
-Caching = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(Caching)
-        
+from caching_dummy import Caching
 
 class Runner:
     def __init__(self, config, tmp_dir, debug):
@@ -185,7 +173,7 @@ class Runner:
         sys.stdout.write(f"Loading {dataset_name}.\n")
         assert dataset_name in ['wikitext2', 'c4', 'minipile'], f"Dataset {dataset_name} not supported."
 
-        data_path = Caching.get_dataset_root(dataset_name, tokenizer=self.tokenizer, seqlen=self.model.seqlen)
+        data_path = Caching.get_dataset_root(dataset_name, tokenizer=self.tokenizer, seqlen=self.model.seqlen, cache_base=self.cache_base)
                 
         if dataset_name == 'wikitext2':
             tmp = {'input_ids': torch.load(os.path.join(data_path, 'input_ids.pt'), weights_only=True),
