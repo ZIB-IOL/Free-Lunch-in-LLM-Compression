@@ -7,10 +7,12 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset
 from torch import Tensor
+from torch.nn import functional as F
 import transformers
 import time
 import torch.nn.utils.prune as prune
-
+import numpy as np
+import os
 
 class PruneUtils:
     """Utilities for pruning"""
@@ -122,7 +124,20 @@ class PruneUtils:
 
             ret_loss += loss.item() * len(inputs)
         return ret_loss / len(inps)
+
+class SequentialLayerBlock(nn.Module):
+    def __init__(self, layer_list):
+        super().__init__()
+        self.layer_list = nn.ModuleList(layer_list)
+        
     
+    def forward(self, x, **kwargs):
+        for layer_idx, layer in enumerate(self.layer_list):
+            x = layer(x, **kwargs)
+            if (layer_idx < len(self.layer_list) - 1) and isinstance(x, tuple):
+                # In case of the last layer, we want to return the tuple
+                x = x[0]
+        return x
 
 class ListDataset(Dataset[tuple[List[Tensor | None], ...]]):
     """Dataset wrapping lists of tensors or None. We use this mainly for making dataloaders of attention masks,
@@ -342,7 +357,7 @@ class Utils:
     
     
     @staticmethod
-    def get_c4_for_calibration(nsamples: int, seed: int, seqlen: int, tokenized_dataset, tokenizer, split: str = "train") -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    def get_c4_for_calibration(nsamples: int, seed: int, seqlen: int, tokenized_dataset, tokenizer, split: str = "train", allow_smaller_seqlen: bool = False) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Get calibration samples from pre-tokenized C4 dataset.
         
         Args:
@@ -357,16 +372,22 @@ class Utils:
         seeded_generator.manual_seed(seed)
         trainloader = []
 
+        goal_seqlen = seqlen
+
         for _ in range(nsamples):
             max_iter = 200000
             it = 0
             while True:
+                seqlen = goal_seqlen
                 # Sample a random sequence
                 i = torch.randint(0, len(traindata), (1,), generator=seeded_generator)
                 # Tokenize the sequence
                 trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
                 # We have found a sequence that is long enough and must not be padded
                 if trainenc.input_ids.shape[1] > seqlen:
+                    break
+                elif allow_smaller_seqlen:
+                    seqlen = trainenc.input_ids.shape[1] - 1
                     break
                 it += 1
                 if it > max_iter:
@@ -434,6 +455,7 @@ class Utils:
     @staticmethod
     def eval_zero_shot(model_name, model, task_list):
         from lm_eval import evaluator, models
+        import lm_eval.models.huggingface
 
         # Get the task dict directly from the provided task list
         #available_tasks = get_task_dict(task_list)
@@ -466,6 +488,134 @@ class Utils:
         results = cleaned_results
 
         return results
+
+    @staticmethod
+    def _clean_results(results):
+        """
+        Remove lm-eval suffixes like ',0' or ',none' from metric keys.
+        """
+        cleaned_results = {"results": {}}
+        for task, task_metrics in results["results"].items():
+            cleaned_results["results"][task] = {}
+            for key, value in task_metrics.items():
+                clean_key = key.replace(",0", "").replace(",none", "")
+                cleaned_results["results"][task][clean_key] = value
+        return cleaned_results
+
+    @staticmethod
+    def _extract_metric(task_metrics, metric_name, preferred_filters=None):
+        """
+        Robustly extract a metric from lm-eval output.
+
+        Examples of keys you may see:
+          - 'pass@1'
+          - 'pass@1_stderr'
+          - 'pass@1,create_test'
+          - 'exact_match,strict-match'
+          - 'exact_match_stderr,flexible-extract'
+        """
+        preferred_filters = preferred_filters or []
+
+        # 1) exact key
+        if metric_name in task_metrics:
+            return task_metrics[metric_name]
+
+        # 2) key with preferred filters
+        for filt in preferred_filters:
+            k = f"{metric_name},{filt}"
+            if k in task_metrics:
+                return task_metrics[k]
+
+        # 3) first key that starts with metric_name + comma
+        candidates = [k for k in task_metrics if k == metric_name or k.startswith(metric_name + ",")]
+        if candidates:
+            return task_metrics[candidates[0]]
+
+        raise KeyError(f"Could not find metric '{metric_name}' in keys: {list(task_metrics.keys())}")
+
+    @staticmethod
+    def _extract_stderr(task_metrics, metric_name, preferred_filters=None):
+        """
+        Robustly extract stderr for a metric from lm-eval output.
+        """
+        preferred_filters = preferred_filters or []
+        stderr_name = f"{metric_name}_stderr"
+
+        # 1) exact key
+        if stderr_name in task_metrics:
+            return task_metrics[stderr_name]
+
+        # 2) key with preferred filters
+        for filt in preferred_filters:
+            k = f"{stderr_name},{filt}"
+            if k in task_metrics:
+                return task_metrics[k]
+
+        # 3) first key that starts with stderr_name + comma
+        candidates = [k for k in task_metrics if k == stderr_name or k.startswith(stderr_name + ",")]
+        if candidates:
+            return task_metrics[candidates[0]]
+
+        return np.nan  # some tasks may not report stderr
+
+    @staticmethod
+    def eval_reasoning(
+        model_name,
+        model,
+        task_list,
+        gsm8k_variant="gsm8k",
+        limit=None,
+    ):
+        """
+        Evaluate reasoning/code tasks with lm-evaluation-harness.
+
+        Args:
+            model_name: string model identifier
+            model: loaded HF model object
+            task_list: e.g. ["humaneval", "gsm8k"]
+            gsm8k_variant: "gsm8k" or "gsm8k_cot"
+            gsm8k_num_fewshot: override few-shot for GSM8K. Use 0 for zero-shot.
+            limit: optional example limit
+        """
+        from lm_eval import evaluator, models
+        import lm_eval.models.huggingface
+
+        # HumanEval executes generated code.
+        # HF's code-eval metric requires this env var before running.
+        if any("humaneval" in t for t in task_list):
+            os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+
+        model_args = f"pretrained={model_name},cache_dir=./llm_weights"
+
+        lm = models.huggingface.HFLM(pretrained=model)
+
+        # Per-task overrides
+        task_manager = None
+
+        # If you want gsm8k_cot instead of gsm8k, swap it here.
+        resolved_tasks = []
+        for t in task_list:
+            if t == "gsm8k":
+                resolved_tasks.append(gsm8k_variant)
+            else:
+                resolved_tasks.append(t)
+
+        # lm-eval accepts a single num_fewshot for the run.
+        # Since HumanEval is 0-shot anyway, using 0 here is fine if your list is
+        # ["humaneval", "gsm8k"] and you want zero-shot GSM8K.
+
+        results = evaluator.simple_evaluate(
+            model=lm,
+            model_args=model_args,
+            tasks=resolved_tasks,
+            batch_size=None,
+            device=None,
+            check_integrity=False,
+            log_samples=True,                 # useful for generative tasks
+            confirm_run_unsafe_code=True,    # required for HumanEval
+        )
+
+        return Utils._clean_results(results)
 
 
     @staticmethod
@@ -571,6 +721,21 @@ class Utils:
                     wrapper_list.append(wrapper_class(layer, matrix_name="up_proj", last_in_block=False))
                     wrapper_list.append(wrapper_class(layer, matrix_name="down_proj", last_in_block=True))
             return wrapper_list
+        elif block_size == -4:
+            layer_list = Utils.get_layerblock_list(model=model, block_size=1)
+            wrapper_list = []
+            for layer in layer_list:
+                wrapper_class = AttnWrapperPerMatrixLlama
+                wrapper_list.append(wrapper_class(layer, matrix_names="k_proj", last_in_block=True))
+                wrapper_class = MLPWrapperPerMatrixLlama
+                wrapper_list.append(wrapper_class(layer, matrix_name="up_proj", last_in_block=True))
+            return wrapper_list
+        elif block_size == -5:
+            layer_list = Utils.get_layerblock_list(model=model, block_size=1)
+            wrapper_list = []
+            for layer in layer_list:
+                wrapper_list.append(KAndUpWrapper(layer))
+            return wrapper_list
         else:
             raise ValueError("Invalid block_size")
 
@@ -579,19 +744,6 @@ class Utils:
     def join_sequential_layers(layer_list: list):
         """Returns a module that simply sequentially forwards through the layers in layer_list."""
         # Note: We cannot use torch.nn.Sequential here, since its forward does not expect additional kwargs
-        class SequentialLayerBlock(nn.Module):
-            def __init__(self, layer_list):
-                super().__init__()
-                self.layer_list = nn.ModuleList(layer_list)
-                
-            
-            def forward(self, x, **kwargs):
-                for layer_idx, layer in enumerate(self.layer_list):
-                    x = layer(x, **kwargs)
-                    if (layer_idx < len(self.layer_list) - 1) and isinstance(x, tuple):
-                        # In case of the last layer, we want to return the tuple
-                        x = x[0]
-                return x
         
         return SequentialLayerBlock(layer_list)
    
@@ -957,6 +1109,53 @@ class FLAPWrapper:
 
 
 # wrap transformer blocks to only expose certain parts
+
+class KAndUpWrapper(nn.Module):
+    def __init__(self, module: torch.nn.Module):
+        super().__init__()
+        # hide the module from methods like .parameters() by wrapping it in a tuple
+        self.module = (module,)
+        self.k_proj = module.self_attn.k_proj
+        self.up_proj = module.mlp.up_proj
+        self.hook_handle = None
+        self.pass_through = False
+        self.last_in_block = True
+        self.output_activation = None
+    
+    def get_hook(self):
+        def hook_fn(module, inp, out):
+            assert self.output_activation is None, "Output activation already set."
+            self.output_activation = out
+            raise ValueError
+        return hook_fn
+
+    def register_hook(self):
+        assert self.hook_handle is None, "Hook already registered."
+        self.hook_handle = self.up_proj.register_forward_hook(self.get_hook())
+
+    def remove_hook(self):
+        if self.hook_handle is not None:
+            self.hook_handle.remove()
+            self.hook_handle = None
+
+    def activate_pass_through(self):
+        self.pass_through = True
+        self.remove_hook()
+
+    def deactivate_pass_through(self):
+        self.pass_through = False
+
+    def forward(self, x: torch.Tensor, **kwargs):
+        if not self.pass_through:
+            self.register_hook()
+        try:
+            out = self.module[0](x, **kwargs)
+        except ValueError:
+            out = self.output_activation
+        self.remove_hook()
+        self.output_activation = None
+        return out
+
 
 class AttnWrapper(nn.Module):
     def __init__(self, module: torch.nn.Module, set_submodules: bool = True):
@@ -1543,6 +1742,351 @@ class DictAccessor(dict):
     def __setattr__(self, name, value):
         self[name] = value
 
+
+class RecErrorWrapperLlama(torch.nn.Module):
+    '''
+    Wrapper for two LLaMA transformer blocks to accumulate the running mean reconstruction error per matrix.
+    '''
+    def __init__(self, module_original: torch.nn.Module, module_pruned: torch.nn.Module,
+                 matrix_name: str | None = None, loss_fn: torch.nn.Module = None):
+        super().__init__()
+        self.matrix_names = ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"]
+        if matrix_name is not None:
+            assert matrix_name in self.matrix_names, "Invalid matrix name."
+            self.matrix_names = [matrix_name]
+        self.module_original = module_original
+        self.module_pruned = module_pruned
+        self.hook_handles = []
+        self.accum_errors_mean = {mn: 0 for mn in self.matrix_names}
+        self.accum_errors_max = {mn: 0 for mn in self.matrix_names}
+        self.output_activations_original = {mn: None for mn in self.matrix_names}
+        self.output_activations_pruned = {mn: None for mn in self.matrix_names}
+        self.sample_counts = {mn: 0 for mn in self.matrix_names}
+        self.reset_accum_errors()
+        self.reset_output_activations()
+        self.loss_fn = loss_fn
+
+    def reset_accum_errors(self):
+        assert isinstance(self.accum_errors_mean, dict), "accum_errors_mean must be a dictionary"
+        assert set(self.accum_errors_mean.keys()) == set(self.matrix_names), "Invalid or missing matrix name in accum_errors_mean."
+        assert isinstance(self.accum_errors_max, dict), "accum_errors_max must be a dictionary"
+        assert set(self.accum_errors_max.keys()) == set(self.matrix_names), "Invalid or missing matrix name in accum_errors_max."
+        for matrix_name in self.matrix_names:
+            self.accum_errors_mean[matrix_name] = 0
+            self.accum_errors_max[matrix_name] = 0
+        self.sample_counts = {}
+        for matrix_name in self.matrix_names:
+            self.sample_counts[matrix_name] = 0
+
+    def reset_output_activations(self):
+        assert isinstance(self.output_activations_original, dict), "output_activations_original must be a dictionary"
+        assert isinstance(self.output_activations_pruned, dict), "output_activations_pruned must be a dictionary"
+        assert set(self.output_activations_original.keys()) == set(self.matrix_names), "Invalid or missing matrix name in output_activations_original."
+        assert set(self.output_activations_pruned.keys()) == set(self.matrix_names), "Invalid or missing matrix name in output_activations_pruned."
+        for matrix_name in self.matrix_names:
+            self.output_activations_original[matrix_name] = None
+            self.output_activations_pruned[matrix_name] = None
+
+    def accumulate_error(self):
+        for matrix_name in self.matrix_names:
+            if self.loss_fn is not None and "cosine" in self.loss_fn:
+                error = torch.sum(self.output_activations_original[matrix_name].float() * self.output_activations_pruned[matrix_name].float(), dim=-1)
+                error /= torch.sum(self.output_activations_original[matrix_name].float()**2, dim=-1)
+                error /= torch.sum(self.output_activations_pruned[matrix_name].float()**2, dim=-1)
+            else:
+                error = torch.sum((self.output_activations_original[matrix_name].float() - self.output_activations_pruned[matrix_name].float())**2, dim=-1)
+            error /= torch.sum(self.output_activations_original[matrix_name].float()**2, dim=-1)
+            error_max = torch.max(error)
+            error_mean = error.sum().item()
+            self.sample_counts[matrix_name] += self.output_activations_original[matrix_name].shape[0]
+            self.accum_errors_mean[matrix_name] *= (self.sample_counts[matrix_name] - self.output_activations_original[matrix_name].shape[0]) / self.sample_counts[matrix_name]
+            self.accum_errors_mean[matrix_name] += error_mean / self.sample_counts[matrix_name]
+            self.accum_errors_max[matrix_name] = max(self.accum_errors_max[matrix_name], error_max)
+        self.reset_output_activations()
+
+    def hook(self, matrix_name, original):
+        if original:
+            def hook_fn(module, inp, out):
+                shape = out.shape
+                if len(shape) > 2:
+                    self.output_activations_original[matrix_name] = out.detach().reshape(-1, shape[-1])
+                else:
+                    self.output_activations_original[matrix_name] = out.detach()
+        else:
+            def hook_fn(module, inp, out):
+                shape = out.shape
+                if len(shape) > 2:
+                    self.output_activations_pruned[matrix_name] = out.detach().reshape(-1, shape[-1])
+                else:
+                    self.output_activations_pruned[matrix_name] = out.detach()
+        return hook_fn
+
+    def register_hooks(self):
+        assert len(self.hook_handles) == 0, "Hooks already registered."
+        for matrix_name in self.matrix_names:
+            if matrix_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+                self.hook_handles.append(getattr(self.module_original.self_attn, matrix_name).register_forward_hook(self.hook(matrix_name, original=True)))
+                self.hook_handles.append(getattr(self.module_pruned.self_attn, matrix_name).register_forward_hook(self.hook(matrix_name, original=False)))
+            else:
+                self.hook_handles.append(getattr(self.module_original.mlp, matrix_name).register_forward_hook(self.hook(matrix_name, original=True)))
+                self.hook_handles.append(getattr(self.module_pruned.mlp, matrix_name).register_forward_hook(self.hook(matrix_name, original=False)))
+
+    def remove_hooks(self):
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles = []
+
+    def free(self):
+        self.remove_hooks()
+        self.reset_output_activations()
+        self.reset_accum_errors()
+
+    def forward(self, x_original, x_pruned, **kwargs):
+        x_original = self.module_original(x_original, **kwargs)
+        x_pruned = self.module_pruned(x_pruned, **kwargs)
+
+        self.accumulate_error()
+
+        return x_original, x_pruned
+
+        
+@torch.no_grad()
+def check_reconstruction_error_per_matrix(original_model, pruned_model, args, runner):
+    device = args.device
+    layers_original = Utils.get_reconstruction_layers(model=original_model, block_size=1, rec=True, runner=runner)
+    layers_pruned = Utils.get_reconstruction_layers(model=pruned_model, block_size=1, rec=True, runner=runner)
+    
+    if args.reconstruct_with_max_information_data:
+        sys.stdout.write("Loading calibration data filtered for constant seqlen.\n")
+        train_dataloader = Utils.get_c4_for_calibration(nsamples=args.reconstruct_n_samples, seed=args.seed,
+                                                        seqlen=original_model.seqlen, tokenized_dataset=runner.get_dataset(args.train_dataset_name),
+                                                        tokenizer=runner.tokenizer, split="train")
+        validation_dataloader = Utils.get_c4_for_calibration(nsamples=32, seed=1,
+                                                        seqlen=original_model.seqlen, tokenized_dataset=runner.get_dataset(args.train_dataset_name),
+                                                        tokenizer=runner.tokenizer, split="validation")
+    else:
+        sys.stdout.write("Loading calibration data without filtering.\n")
+        train_dataloader = Utils.get_c4_for_calibration_no_filter(nsamples=args.reconstruct_n_samples, seed=args.seed,
+                                                            tokenized_dataset=runner.get_dataset(args.train_dataset_name),
+                                                            tokenizer=runner.tokenizer, runner=runner, split="train")
+        validation_dataloader = Utils.get_c4_for_calibration_no_filter(nsamples=32, seed=1,
+                                                            tokenized_dataset=runner.get_dataset(args.train_dataset_name),
+                                                            tokenizer=runner.tokenizer, runner=runner, split="validation")
+
+    inps_tr_orig, outs_tr_orig, attention_mask_tr, position_ids_tr, position_embeddings_tr, loss_mask_tr = PruneUtils.prepare_calibration_input(args, original_model, train_dataloader, device, pad_token_id=runner.tokenizer.pad_token_id,
+                                                                                                                         mask_pad_tokens=args.mask_pad_tokens)
+    inps_tr_pruned, outs_tr_pruned, _, _, _, _ = PruneUtils.prepare_calibration_input(args, pruned_model, train_dataloader, device, pad_token_id=runner.tokenizer.pad_token_id,
+                                                                                                                         mask_pad_tokens=args.mask_pad_tokens)
+    inps_val_orig, outs_val_orig, attention_mask_val, position_ids_val, position_embeddings_val, loss_mask_val = PruneUtils.prepare_calibration_input(args, original_model, validation_dataloader, device, pad_token_id=runner.tokenizer.pad_token_id,
+                                                                                                                         mask_pad_tokens=args.mask_pad_tokens)
+    inps_val_pruned, outs_val_pruned, _, _, _, _ = PruneUtils.prepare_calibration_input(args, pruned_model, validation_dataloader, device, pad_token_id=runner.tokenizer.pad_token_id,
+                                                                                                                         mask_pad_tokens=args.mask_pad_tokens)
+
+    errors_train_mean = {}
+    errors_val_mean = {}
+    errors_train_max = {}
+    errors_val_max = {}
+    for i, (layer_original, layer_pruned) in enumerate(zip(layers_original, layers_pruned)):
+        rec_error_wrapper_tr = RecErrorWrapperLlama(layer_original, layer_pruned, loss_fn=runner.config.loss_fn)
+        rec_error_wrapper_tr.register_hooks()
+        rec_error_wrapper_val = RecErrorWrapperLlama(layer_original, layer_pruned, loss_fn=runner.config.loss_fn)
+        rec_error_wrapper_val.register_hooks()
+
+        zip_list_tr = [
+            inps_tr_orig, inps_tr_pruned,
+            attention_mask_tr if attention_mask_tr is not None else [None] * len(inps_tr_orig),
+            position_ids_tr if position_ids_tr is not None else [None] * len(inps_tr_orig),
+            position_embeddings_tr if position_embeddings_tr is not None else [None] * len(inps_tr_orig),
+        ]
+        zip_list_val = [
+            inps_val_orig, inps_val_pruned,
+            attention_mask_val if attention_mask_val is not None else [None] * len(inps_val_orig),
+            position_ids_val if position_ids_val is not None else [None] * len(inps_val_orig),
+            position_embeddings_val if position_embeddings_val is not None else [None] * len(inps_val_orig),
+        ]
+
+        for j, (inpo, inpp, amask, pids, pembeds) in enumerate(zip(*zip_list_tr)):
+            kwargs = {}
+            if amask is not None:
+                kwargs['attention_mask'] = amask.to(device)
+            if pids is not None:
+                kwargs['position_ids'] = pids.to(device)
+            if pembeds is not None:
+                kwargs['position_embeddings'] = (pembeds[0].to(device), pembeds[1].to(device))
+            
+            out = rec_error_wrapper_tr(inpo.to(device), inpp.to(device), **kwargs)
+            if (new_shape := outs_tr_orig[j].shape) != out[0].shape and outs_tr_orig[j].numel() == out[0].numel():
+                out[0] = out[0].reshape(new_shape)
+            if (new_shape := outs_tr_pruned[j].shape) != out[1].shape and outs_tr_pruned[j].numel() == out[1].numel():
+                out[1] = out[1].reshape(new_shape)
+            outs_tr_orig[j] = out[0].cpu()
+            outs_tr_pruned[j] = out[1].cpu()
+
+        for j, (inpo, inpp, amask, pids, pembeds) in enumerate(zip(*zip_list_val)):
+            kwargs = {}
+            if amask is not None:
+                kwargs['attention_mask'] = amask.to(device)
+            if pids is not None:
+                kwargs['position_ids'] = pids.to(device)
+            if pembeds is not None:
+                kwargs['position_embeddings'] = (pembeds[0].to(device), pembeds[1].to(device))
+            out = rec_error_wrapper_val(inpo.to(device), inpp.to(device), **kwargs)
+            if (new_shape := outs_val_orig[j].shape) != out[0].shape and outs_val_orig[j].numel() == out[0].numel():
+                out[0] = out[0].reshape(new_shape)
+            if (new_shape := outs_val_pruned[j].shape) != out[1].shape and outs_val_pruned[j].numel() == out[1].numel():
+                out[1] = out[1].reshape(new_shape)
+            outs_val_orig[j] = out[0].cpu()
+            outs_val_pruned[j] = out[1].cpu()
+
+        for mn in rec_error_wrapper_tr.matrix_names:
+            errors_train_mean[f"cal_set_layer_{i+1}_{mn}"] = rec_error_wrapper_tr.accum_errors_mean[mn]
+            errors_train_max[f"cal_set_layer_{i+1}_{mn}"] = rec_error_wrapper_tr.accum_errors_max[mn]
+            errors_val_mean[f"val_set_layer_{i+1}_{mn}"] = rec_error_wrapper_val.accum_errors_mean[mn]
+            errors_val_max[f"val_set_layer_{i+1}_{mn}"] = rec_error_wrapper_val.accum_errors_max[mn]
+        
+        inps_tr_orig = [o.clone() for o in outs_tr_orig]
+        inps_tr_pruned = [o.clone() for o in outs_tr_pruned]
+        inps_val_orig = [o.clone() for o in outs_val_orig]
+        inps_val_pruned = [o.clone() for o in outs_val_pruned]
+    
+        rec_error_wrapper_tr.free()
+        rec_error_wrapper_val.free()
+    return errors_train_mean, errors_val_mean, errors_train_max, errors_val_max
+
+
+@torch.no_grad()
+def check_local_reconstruction_error_per_matrix(original_model, pruned_model, args, runner):
+    device = args.device
+    layers_original = Utils.get_reconstruction_layers(model=original_model, block_size=1, rec=True, runner=runner)
+    layers_pruned = Utils.get_reconstruction_layers(model=pruned_model, block_size=1, rec=True, runner=runner)
+    matrix_names = ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"]
+    
+    if args.reconstruct_with_max_information_data:
+        sys.stdout.write("Loading calibration data filtered for constant seqlen.\n")
+        train_dataloader = Utils.get_c4_for_calibration(nsamples=args.reconstruct_n_samples, seed=args.seed,
+                                                        seqlen=original_model.seqlen, tokenized_dataset=runner.get_dataset(args.train_dataset_name),
+                                                        tokenizer=runner.tokenizer, split="train")
+        validation_dataloader = Utils.get_c4_for_calibration(nsamples=32, seed=1,
+                                                        seqlen=original_model.seqlen, tokenized_dataset=runner.get_dataset(args.train_dataset_name),
+                                                        tokenizer=runner.tokenizer, split="validation")
+    else:
+        sys.stdout.write("Loading calibration data without filtering.\n")
+        train_dataloader = Utils.get_c4_for_calibration_no_filter(nsamples=args.reconstruct_n_samples, seed=args.seed,
+                                                            tokenized_dataset=runner.get_dataset(args.train_dataset_name),
+                                                            tokenizer=runner.tokenizer, runner=runner, split="train")
+        validation_dataloader = Utils.get_c4_for_calibration_no_filter(nsamples=32, seed=1,
+                                                            tokenized_dataset=runner.get_dataset(args.train_dataset_name),
+                                                            tokenizer=runner.tokenizer, runner=runner, split="validation")
+
+    inps_tr_orig, outs_tr_orig, attention_mask_tr, position_ids_tr, position_embeddings_tr, loss_mask_tr = PruneUtils.prepare_calibration_input(args, original_model, train_dataloader, device, pad_token_id=runner.tokenizer.pad_token_id,
+                                                                                                                         mask_pad_tokens=args.mask_pad_tokens)
+    _, outs_tr_pruned, _, _, _, _ = PruneUtils.prepare_calibration_input(args, pruned_model, train_dataloader, device, pad_token_id=runner.tokenizer.pad_token_id,
+                                                                                                                         mask_pad_tokens=args.mask_pad_tokens)
+    inps_val_orig, outs_val_orig, attention_mask_val, position_ids_val, position_embeddings_val, loss_mask_val = PruneUtils.prepare_calibration_input(args, original_model, validation_dataloader, device, pad_token_id=runner.tokenizer.pad_token_id,
+                                                                                                                         mask_pad_tokens=args.mask_pad_tokens)
+    _, outs_val_pruned, _, _, _, _ = PruneUtils.prepare_calibration_input(args, pruned_model, validation_dataloader, device, pad_token_id=runner.tokenizer.pad_token_id,
+                                                                                                                         mask_pad_tokens=args.mask_pad_tokens)
+
+    errors_train_mean = {}
+    errors_val_mean = {}
+    errors_train_max = {}
+    errors_val_max = {}
+
+    def get_matrix(layer, matrix_name):
+        if matrix_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            return getattr(layer.self_attn, matrix_name)
+        else:
+            return getattr(layer.mlp, matrix_name)
+
+
+    for i, (layer_original, layer_pruned) in enumerate(zip(layers_original, layers_pruned)):
+        # for every matrix, check the error after that matrix as if it is the only pruned matrix in the model
+        pruned_matrices = {matrix_name: get_matrix(layer_pruned, matrix_name).weight.data.clone() for matrix_name in matrix_names}
+        for matrix_name in matrix_names:
+            for matrix_name2 in matrix_names: # reset all matrices to original
+                get_matrix(layer_pruned, matrix_name2).weight.data = get_matrix(layer_original, matrix_name2).weight.data.clone()
+            # set the current matrix to the pruned matrix
+            get_matrix(layer_pruned, matrix_name).weight.data = pruned_matrices[matrix_name].clone()
+
+            rec_error_wrapper_tr = RecErrorWrapperLlama(layer_original, layer_pruned, matrix_name=matrix_name, loss_fn=runner.config.loss_fn)
+            rec_error_wrapper_tr.register_hooks()
+            rec_error_wrapper_val = RecErrorWrapperLlama(layer_original, layer_pruned, matrix_name=matrix_name, loss_fn=runner.config.loss_fn)
+            rec_error_wrapper_val.register_hooks()
+
+            zip_list_tr = [
+                inps_tr_orig,
+                attention_mask_tr if attention_mask_tr is not None else [None] * len(inps_tr_orig),
+                position_ids_tr if position_ids_tr is not None else [None] * len(inps_tr_orig),
+                position_embeddings_tr if position_embeddings_tr is not None else [None] * len(inps_tr_orig),
+            ]
+            zip_list_val = [
+                inps_val_orig,
+                attention_mask_val if attention_mask_val is not None else [None] * len(inps_val_orig),
+                position_ids_val if position_ids_val is not None else [None] * len(inps_val_orig),
+                position_embeddings_val if position_embeddings_val is not None else [None] * len(inps_val_orig),
+            ]
+
+            for j, (inpo, amask, pids, pembeds) in enumerate(zip(*zip_list_tr)):
+                kwargs = {}
+                if amask is not None:
+                    kwargs['attention_mask'] = amask.to(device)
+                if pids is not None:
+                    kwargs['position_ids'] = pids.to(device)
+                if pembeds is not None:
+                    kwargs['position_embeddings'] = (pembeds[0].to(device), pembeds[1].to(device))
+                
+                out = rec_error_wrapper_tr(inpo.to(device), inpo.to(device), **kwargs)
+                if (new_shape := outs_tr_orig[j].shape) != out[0].shape and outs_tr_orig[j].numel() == out[0].numel():
+                    out[0] = out[0].reshape(new_shape)
+                if (new_shape := outs_tr_pruned[j].shape) != out[1].shape and outs_tr_pruned[j].numel() == out[1].numel():
+                    out[1] = out[1].reshape(new_shape)
+                outs_tr_orig[j] = out[0].cpu()
+                outs_tr_pruned[j] = out[1].cpu()
+
+            for j, (inpo, amask, pids, pembeds) in enumerate(zip(*zip_list_val)):
+                kwargs = {}
+                if amask is not None:
+                    kwargs['attention_mask'] = amask.to(device)
+                if pids is not None:
+                    kwargs['position_ids'] = pids.to(device)
+                if pembeds is not None:
+                    kwargs['position_embeddings'] = (pembeds[0].to(device), pembeds[1].to(device))
+                out = rec_error_wrapper_val(inpo.to(device), inpo.to(device), **kwargs)
+                if (new_shape := outs_val_orig[j].shape) != out[0].shape and outs_val_orig[j].numel() == out[0].numel():
+                    out[0] = out[0].reshape(new_shape)
+                if (new_shape := outs_val_pruned[j].shape) != out[1].shape and outs_val_pruned[j].numel() == out[1].numel():
+                    out[1] = out[1].reshape(new_shape)
+                outs_val_orig[j] = out[0].cpu()
+                outs_val_pruned[j] = out[1].cpu()
+
+            for mn in rec_error_wrapper_tr.matrix_names:
+                errors_train_mean[f"cal_set_layer_{i+1}_{mn}"] = rec_error_wrapper_tr.accum_errors_mean[mn]
+                errors_train_max[f"cal_set_layer_{i+1}_{mn}"] = rec_error_wrapper_tr.accum_errors_max[mn]
+                errors_val_mean[f"val_set_layer_{i+1}_{mn}"] = rec_error_wrapper_val.accum_errors_mean[mn]
+                errors_val_max[f"val_set_layer_{i+1}_{mn}"] = rec_error_wrapper_val.accum_errors_max[mn]
+
+            rec_error_wrapper_tr.free()
+            rec_error_wrapper_val.free()
+            
+        inps_tr_orig = [o.clone() for o in outs_tr_orig]
+        inps_val_orig = [o.clone() for o in outs_val_orig]
+
+    return errors_train_mean, errors_val_mean, errors_train_max, errors_val_max
+
+
+def get_block_importance(args, layers, inputs, outs, attention_mask, position_ids, position_embeddings, loss_mask, device):
+    """
+    Compute importances as cosine similarities of inputs and outputs of every layer.
+    """
+    importances = []
+    for layer in layers:
+        Utils.get_outputs(args=args, layer=layer, inps=inputs, outs=outs, attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings, loss_mask=loss_mask, device=device)
+        x = 0
+        for inp, out in zip(inputs, outs):
+            x += torch.cosine_similarity(inp.view(-1, inp.shape[-1]), out.view(-1, out.shape[-1]), dim=1).mean().item()
+        importances.append(x)
+        inputs = [o.clone() for o in outs]
+    return importances
 
 # functions for FLAP
 

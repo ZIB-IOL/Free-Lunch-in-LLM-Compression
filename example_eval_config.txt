@@ -1,0 +1,42 @@
+command:
+- ${interpreter}
+- ${program}
+- ${args}
+method: grid
+metric:
+  goal: minimize
+  name: train.loss
+parameters:
+  distribute_reconstruction_blocks:
+    distribution: categorical
+    values:
+    - false
+  eval_reasoning:
+    distribution: categorical
+    values:
+    - true
+  eval_zero_shot:
+    distribution: categorical
+    values:
+    - true
+  goal_sparsity:
+    distribution: categorical
+    values:
+    - 0.0
+  mask_pad_tokens:
+    distribution: categorical
+    values:
+    - false
+  model:
+    distribution: categorical
+    values:
+    - meta-llama/Llama-3.1-8B
+  seed:
+    distribution: categorical
+    values:
+    - 1
+  training_mode:
+    distribution: categorical
+    values:
+    - null
+program: main.py

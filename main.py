@@ -5,14 +5,12 @@ import socket
 import sys
 import tempfile
 from contextlib import contextmanager
-
-import torch
 import wandb
 
 from runner import Runner
 from utilities import Utils
 
-TMP_DIR_ROOT = '/scratch/local/'
+TMP_DIR_ROOT = 'PATH_TO_TMP_DIR'
 
 debug = "--debug" in sys.argv
 
@@ -38,9 +36,10 @@ defaults = dict(
     #model='facebook/opt-2.7b',
     #model='facebook/opt-1.3b',
     model='facebook/opt-125m',
+    checkpoint_sweep_id=None,  # None or the sweep id of the checkpoint to use
     calibration_dataset="c4",
     goal_sparsity=0.5,
-    prune_method='wanda',
+    prune_method='magnitude',
     sparsity_type='unstructured',    # Must be in [None, 'unstructured', '2:4', '4:8'], defaults to 'unstructured'
     ria_alpha=0.5,
     flap_metric="WIFV",
@@ -77,26 +76,29 @@ defaults = dict(
     block_size=1,         # -1 for attn/MLP split, -2 for every matrix separately
     pruning_block_size=1, # different block size for pruning
     n_iterations=0,       # for 0, we use all samples once (if n_epochs is not set, 0, or 1)
-    n_epochs=1,           # 0, None, or False behave the same. for 1 or more, n_iterations is
+    n_epochs=3,           # 0, None, or False behave the same. for 1 or more, n_iterations is
                           # overridden and we iterate over the dataset n_epochs times
-    initial_lr=1e-05,     # Initial learning rate for linear decay
+    initial_lr=1e-06,     # Initial learning rate for linear decay
     weight_decay=None,    # Defaults to 0
     gradient_accumulation_steps=1,   # Defaults to 1
     gradient_checkpointing=False,
     optim=None,           # Defaults to AdamW, must be in [None, adafactor, adamw_bnb_8bit, sgd]
     momentum=0.9,         # Defaults to 0.9
     lr_scheduler_type='linear', # Defaults to 'linear
-    loss_fn='ce',                 # ce, mse, mse_normalized, cosine, distill_ce, distill_mse
+    loss_fn='mse',                 # mse, cosine, mse_normalized
     max_grad_norm=None,
+    frac_skip_rec=0.0,
 
     # Evaluation
     eval_zero_shot=False,
+    eval_reasoning=False,
     do_eval=False,    # Enable evaluation throughout training
 
     # Other
-    include_tokens_per_second=False,    # Defaults to False since it increases the overall runtime
     log_train_loss=False,
     log_grad_norm=False,
+    attn_implementation="flash_attention_2",
+    save_best_model=False,
     )
 
 if not debug:
@@ -107,7 +109,7 @@ if not debug:
 defaults['computer'] = socket.gethostname()
 
 # Configure wandb logging
-wandb.init(
+run = wandb.init(
     config=defaults,
     project='test-000',  # automatically changed in sweep
     entity=None,  # automatically changed in sweep
@@ -140,7 +142,7 @@ def tempdir():
 
 
 with tempdir() as tmp_dir:
-    runner = Runner(config=config, tmp_dir=tmp_dir, debug=debug)
+    runner = Runner(config=config, tmp_dir=tmp_dir, debug=debug, sweep_id=run.sweep_id)
     runner.run()
 
     # Close wandb run

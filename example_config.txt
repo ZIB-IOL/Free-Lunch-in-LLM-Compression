@@ -1,0 +1,131 @@
+command:
+- ${interpreter}
+- ${program}
+- ${args}
+method: grid
+metric:
+  goal: minimize
+  name: train.loss
+parameters:
+  batch_size:
+    distribution: categorical
+    values:
+    - 2
+  block_size:
+    distribution: categorical
+    values:
+    - -1
+  checkpointdir:
+    distribution: categorical
+    values:
+    - path_to_checkpoint_directory
+  distribute_reconstruction_blocks:
+    distribution: categorical
+    values:
+    - false
+  eval_reasoning:
+    distribution: categorical
+    values:
+    - false
+  eval_zero_shot:
+    distribution: categorical
+    values:
+    - false
+  goal_sparsity:
+    distribution: categorical
+    values:
+    - 0.5
+  gradient_accumulation_steps:
+    distribution: categorical
+    values:
+    - 1
+  gradient_checkpointing:
+    distribution: categorical
+    values:
+    - false
+  initial_lr:
+    distribution: categorical
+    values:
+    - 1e-07
+    - 5e-07
+    - 1e-06
+    - 5e-06
+    - 1e-05
+    - 5e-05
+    - 0.0001
+    - 0.0005
+  loss_fn:
+    distribution: categorical
+    values:
+    - mse
+  mask_pad_tokens:
+    distribution: categorical
+    values:
+    - false
+  model:
+    distribution: categorical
+    values:
+    - meta-llama/Llama-3.1-8B
+  n_epochs:
+    distribution: categorical
+    values:
+    - 1
+    - 5
+    - 10
+  n_iterations:
+    distribution: categorical
+    values:
+    - 0
+  peft_strategy:
+    distribution: categorical
+    values:
+    - BlockOnlyFullFT
+  propagate_sparse_activations_prune:
+    distribution: categorical
+    values:
+    - false
+  propagate_sparse_activations_reconstruct:
+    distribution: categorical
+    values:
+    - false
+  prune_method:
+    distribution: categorical
+    values:
+    - wanda
+  prune_whole_matrix:
+    distribution: categorical
+    values:
+    - false
+  pruning_block_size:
+    distribution: categorical
+    values:
+    - 1
+  reconstruct_n_samples:
+    distribution: categorical
+    values:
+    - 1024
+  reconstruct_with_max_information_data:
+    distribution: categorical
+    values:
+    - true
+  save_best_model:
+    distribution: categorical
+    values:
+    - true
+  seed:
+    distribution: categorical
+    values:
+    - 1
+  sparsity_type:
+    distribution: categorical
+    values:
+    - "2:4"
+  training_mode:
+    distribution: categorical
+    values:
+    - reconstruct
+  use_dense_targets:
+    distribution: categorical
+    values:
+    - true
+program: main.py

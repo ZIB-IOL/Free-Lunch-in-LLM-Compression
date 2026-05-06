@@ -1,0 +1,47 @@
+command:
+- ${interpreter}
+- ${program}
+- ${args}
+method: grid
+metric:
+  goal: minimize
+  name: train.loss
+parameters:
+  batch_size:
+    distribution: categorical
+    values:
+    - 1
+  calibration_dataset:
+    distribution: categorical
+    values:
+    - c4
+  check_local_errors:
+    distribution: categorical
+    values:
+    - true
+    - false
+  checkpointdir:
+    distribution: categorical
+    values:
+    - path_to_checkpoint_directory
+  loss_fn:
+    distribution: categorical
+    values:
+    - mse
+  model:
+    distribution: categorical
+    values:
+    - meta-llama/Llama-3.1-8B
+  reconstruct_n_samples:
+    distribution: categorical
+    values:
+    - 256
+  seed:
+    distribution: categorical
+    values:
+    - 1
+  sweep_ids:
+    distribution: categorical
+    values:
+    - comma separated list of ids of sweeps that each saved some pruned/reconstructed meta-llama/Llama-3.1-8B checkpoint
+program: check_act_dist_main.py

@@ -3,12 +3,15 @@ from tqdm import tqdm
 from typing import NamedTuple, Optional 
 import torch
 import torch.nn as nn
+import math
 
 import torch.nn.utils.prune as prune
-from utilities import Utils, PruneUtils, WandaWrapper, SparseGPTWrapper, SelectiveMethods, AttnWrapper, MLPWrapper, FLAPWrapper, compress
+from utilities import Utils, PruneUtils, WandaWrapper, SparseGPTWrapper, SelectiveMethods, AttnWrapper, MLPWrapper, FLAPWrapper, compress, get_block_importance
 from torch.optim import AdamW, SGD
 from transformers.optimization import get_linear_schedule_with_warmup
 import peft_methods
+
+import sys
 
 class PruneMethod:
 
@@ -47,7 +50,7 @@ class PruneMethod:
                 sys.stdout.write("Loading calibration data filtered for constant seqlen.\n")
                 dataloader = Utils.get_c4_for_calibration(nsamples=self.args.reconstruct_n_samples, seed=self.args.seed,
                                                           seqlen=self.model.seqlen, tokenized_dataset=self.runner.get_dataset(self.args.train_dataset_name),
-                                                          tokenizer=self.runner.tokenizer)
+                                                          tokenizer=self.runner.tokenizer, allow_smaller_seqlen=self.args.train_dataset_name in ["opencode", "gsm8k"])
             else:
                 sys.stdout.write("Loading calibration data without filtering.\n")
                 dataloader = Utils.get_c4_for_calibration_no_filter(nsamples=self.args.reconstruct_n_samples, seed=self.args.seed,
@@ -57,7 +60,7 @@ class PruneMethod:
                 if self.args.reconstruct_with_max_information_data:
                     val_loader = Utils.get_c4_for_calibration(nsamples=32, seed=42,
                                                  seqlen=self.model.seqlen, tokenized_dataset=self.runner.get_dataset(self.args.train_dataset_name),
-                                                 tokenizer=self.runner.tokenizer, split="validation")
+                                                 tokenizer=self.runner.tokenizer, split="validation", allow_smaller_seqlen=self.args.train_dataset_name in ["opencode", "gsm8k"])
                 else:
                     val_loader = Utils.get_c4_for_calibration_no_filter(nsamples=32, seed=42,
                                                                     tokenized_dataset=self.runner.get_dataset(self.args.train_dataset_name),
@@ -94,13 +97,18 @@ class PruneMethod:
                         PruneUtils.prepare_calibration_input(self.args, self.model, dataloader, device, pad_token_id=self.runner.tokenizer.pad_token_id,
                                                              mask_pad_tokens=self.args.mask_pad_tokens)
 
+        if self.args.reconstruct:
+            rec_mem_size = sum([inp.element_size() * inp.numel() for inp in inps_rec])
+            rec_mem_size += sum([out.element_size() * out.numel() for out in outs_rec])
+            print(f"Reconstruction memory size: {rec_mem_size / 1024**2:.2f} MB")
+
         wrappers, hooks = {}, []
 
         # figure out how often we should prune and reconstruct
-        def get_iterations(x, y, pruning: bool = False):
+        def get_iterations(x, y):
             if x <= y:
                 return 1
-            subblockmap = {-1: 2, -2: 6 if self.runner.is_opt else 7} # OPT only has 6 matrices per block
+            subblockmap = {-1: 2, -2: 6 if self.runner.is_opt else 7, -4: 2, -5: 1} # OPT only has 6 matrices per block
             if x > 0 and y > 0:
                 return x // y
             elif x > 0 and y < 0:
@@ -110,8 +118,8 @@ class PruneMethod:
             else:
                 raise ValueError(f"Invalid block sizes: {x} and {y}")
 
-        prune_every = get_iterations(pruning_block_size, reconstruction_block_size, pruning=True)
-        reconstruct_every = get_iterations(reconstruction_block_size, pruning_block_size, pruning=False)
+        prune_every = get_iterations(pruning_block_size, reconstruction_block_size)
+        reconstruct_every = get_iterations(reconstruction_block_size, pruning_block_size)
         sys.stdout.write(f"prune_every: {prune_every}, reconstruct_every: {reconstruct_every}.\n")
         iterations_since_last_reconstruction = 0
         iterations_since_last_pruning = 0
@@ -119,6 +127,25 @@ class PruneMethod:
         layers_prune_iterator = iter(enumerate(layers_prune))
         i_rec, i_prune = 0, 0
 
+        if self.args.reconstruct and self.args.frac_skip_rec > 0:
+            layers_bs1 = Utils.get_reconstruction_layers(model=self.model, block_size=1, rec=True, runner=self.runner)
+            block_importance = get_block_importance(args=self.args, layers=layers_bs1, inputs=[inp.clone() for inp in inps_rec],
+                                                          outs=[out.clone() for out in outs_rec],
+                                                          attention_mask=attention_mask,
+                                                          position_ids=position_ids,
+                                                          position_embeddings=position_embeddings,
+                                                          loss_mask=loss_mask, device=device)
+            blocks_to_skip = math.ceil(len(block_importance) * self.args.frac_skip_rec)
+            blocks_to_skip = sorted(range(len(block_importance)), key=lambda x: block_importance[x], reverse=True)[:blocks_to_skip]
+            sys.stdout.write(f"Blocks to skip: {blocks_to_skip}.\n")
+            if reconstruction_block_size > 1:
+                blocks_to_skip_mask = torch.tensor([i in blocks_to_skip for i in range(len(layers_bs1))]).reshape(-1, reconstruction_block_size)
+            else:
+                blocks_to_skip_mask = None
+        else:
+            blocks_to_skip = []
+            blocks_to_skip_mask = None
+        
         for i in range(max(len(layers_rec), len(layers_prune))):
             new_prune_block, new_reconstruct_block = False, False
             if iterations_since_last_reconstruction == 0 and (i_rec < len(layers_rec) - 1 or (len(layers_rec) == 1 and i_rec == 0)):
@@ -171,8 +198,8 @@ class PruneMethod:
                                           position_ids=position_ids_val, position_embeddings=position_embeddings_val, loss_mask=loss_mask_val, device=device)
             
             # prune the block
-            if prune_now or (do_prune and pruning_block_size > reconstruction_block_size):
-                if pruning_block_size > reconstruction_block_size:
+            if prune_now or (do_prune and pruning_block_size > reconstruction_block_size and not reconstruction_block_size in [-4, -5]):
+                if pruning_block_size > reconstruction_block_size and not reconstruction_block_size in [-4, -5]:
                     # when we reconstruct with a finer granularity than we prune, we save the information for pruning
                     # the whole pruning block but only prune the weights corresponding to the current reconstruction block.
                     # this way we get the correct reconstruction targets when propagating the sparse activations while
@@ -191,6 +218,7 @@ class PruneMethod:
                     subset = {key: subset[key] for key in keys_to_prune}
                     sys.stdout.write(f"Pruning part of layer {i_prune+1} of {len(layers_prune)}\n")
                 else:
+                    subset = Utils.get_layers_of_modules(layer_prune)
                     iterations_since_last_pruning = 0
                     sys.stdout.write(f"Pruning layer {i_prune+1} of {len(layers_prune)}\n")
 
@@ -236,8 +264,6 @@ class PruneMethod:
                     if W_metric is not None:    # True for all methods except wanda_sp and sparsegpt
                         if self.prune_n != 0:
                             W_mask = PruneUtils.get_n_m_pruning_mask(W_saliency=W_metric, prune_n=self.prune_n, prune_m=self.prune_m)
-                        elif self.runner.config.sparsity_type == "blockwise":
-                            W_mask = PruneUtils.get_block_wise_pruning_mask(W_saliency=W_metric)
                         else:
                             if not self.args.prune_whole_matrix and self.prune_method in ["wanda", "ria"]:
                                 sort_res = torch.sort(W_metric, dim=1, stable=True)[1]
@@ -259,7 +285,7 @@ class PruneMethod:
             train_loss = None
             val_loss = None
             grad_norm = None
-            if reconstruct_now:
+            if reconstruct_now and (i_rec not in blocks_to_skip or not reconstruction_block_size > 1):
                 # reconstruct pruned submodel
                 iterations_since_last_reconstruction = 0
                 if self.args.reconstruct:
@@ -271,7 +297,8 @@ class PruneMethod:
                     with torch.enable_grad():
                         train_loss, val_loss, grad_norm = self.reconstruct_weights(layer=layer_rec, inps=inps_rec, outs=target, device=device, attention_mask=attention_mask,
                                                     position_ids=position_ids, position_embeddings=position_embeddings, layer_idx=i_rec, n_layers=len(layers_rec),
-                                                    loss_mask=loss_mask, keep_masks=self.args.keep_masks, val_args=val_args)
+                                                    loss_mask=loss_mask, keep_masks=self.args.keep_masks, val_args=val_args,
+                                                    freeze_mask=blocks_to_skip_mask[i_rec] if blocks_to_skip_mask is not None else None, block_idx=i_prune)
             if train_loss is not None:
                 train_losses[f"train_loss_{i_rec+1}"] = train_loss
             if val_loss is not None:
@@ -341,7 +368,7 @@ class PruneMethod:
     def reconstruct_weights(self, layer: torch.nn.Module, inps: torch.Tensor, outs: torch.Tensor, device: torch.device, attention_mask: Optional[torch.Tensor],
                             position_ids: Optional[torch.Tensor], position_embeddings: Optional[torch.Tensor], layer_idx: int, n_layers: int,
                             ignore_reconstruction_method: bool = False, loss_mask: Optional[torch.Tensor] = None, keep_masks: bool = True,
-                            val_args: Optional[tuple[torch.Tensor, ...]] = None) -> float:
+                            val_args: Optional[tuple[torch.Tensor, ...]] = None, freeze_mask: Optional[torch.Tensor] = None, block_idx: int = 0) -> float:
         """Reconstructs the weights of the layer using the input-output pairs."""
         # "dataloader" for the reconstruction
         zip_list = [
@@ -365,6 +392,13 @@ class PruneMethod:
         if isinstance(layer, AttnWrapper) or isinstance(layer, MLPWrapper):
             SelectiveMethods.deactivate_model(self.model)
             SelectiveMethods.activate_model(layer)
+        if freeze_mask is not None:
+            SelectiveMethods.deactivate_model(self.model)
+            SelectiveMethods.activate_model(layer)
+            for i, block in enumerate(layer.layer_list):
+                if freeze_mask[i]:
+                    SelectiveMethods.deactivate_model(block)
+            print(f"Frozen blocks: {freeze_mask.tolist()}")
         if self.args.constant_layer_norm:
             SelectiveMethods.deactivate_layer_norm_params(layer)
 
@@ -396,6 +430,9 @@ class PruneMethod:
         # loss function
         if self.args.loss_fn == "mse" or self.args.loss_fn is None:
             criterion = nn.MSELoss(reduction="mean").to(device)
+        elif self.args.loss_fn == "mse_normalized":
+            criterion_mse = nn.MSELoss(reduction="none").to(device)
+            criterion = lambda x, y: (criterion_mse(x, y) / x.view(-1, x.shape[-1]).norm(dim=-1, keepdim=True)).mean()
         elif self.args.loss_fn == "cosine":
             criterion_ = nn.CosineSimilarity(dim=-1).to(device)
             criterion = lambda x, y: -1 * criterion_(x, y).mean()
@@ -464,11 +501,11 @@ class PruneMethod:
             gradScaler.scale(loss).backward()
             if need_update:
                 gradScaler.unscale_(optimizer)
-                gradScaler.step(optimizer)
-                gradScaler.update()
                 if self.args.log_grad_norm:
                     grad_norm = [p.grad.norm().item() for p in layer.parameters() if p.grad is not None]
                     grad_norms.append(sum(grad_norm))
+                gradScaler.step(optimizer)
+                gradScaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
                 layer.zero_grad()
@@ -487,8 +524,10 @@ class PruneMethod:
                 param.data = param.data.to(original_dtype)
 
         peft_strategy.at_train_end(layer_subset=Utils.get_layers_of_modules(layer), keep_masks=keep_masks)
-
-        return None if not self.args.log_train_loss else train_losses, None if not self.args.log_train_loss else val_losses, None if not self.args.log_grad_norm else grad_norms
+        ret1 = None if not self.args.log_train_loss else train_losses
+        ret2 = None if not self.args.log_train_loss else val_losses
+        ret3 = None if not self.args.log_grad_norm else grad_norms
+        return ret1, ret2, ret3
 
     def get_wrappers_and_hooks(self, layer_subset: dict) -> tuple[dict, list]:
         """Gets the wrappers and hooks needed for the pruning method."""

@@ -1,5 +1,4 @@
 from collections import namedtuple
-import getpass
 import os
 import sys
 import time
@@ -15,17 +14,18 @@ from utilities import Utils
 
 from transformers import TrainingArguments, Trainer
 import datasets
-import platform
 from prune_methods import PruneMethod
 from prune_flap import PruneFLAP
 
 from caching_dummy import Caching
+CACHE_BASE = os.path.join(os.getcwd(), 'llm_cache')
 
 class Runner:
-    def __init__(self, config, tmp_dir, debug):
+    def __init__(self, config, tmp_dir, debug, sweep_id):
         self.config = config
         self.tmp_dir = tmp_dir
         self.debug = debug
+        self.sweep_id = sweep_id
         sys.stdout.write(f"Using temporary directory {self.tmp_dir}.\n")
 
         self.train_dataset_name = self.config.calibration_dataset or 'c4'
@@ -54,10 +54,10 @@ class Runner:
         else:
             self.n_iterations = self.config.n_iterations
 
-        self.cache_base = os.path.join(os.getcwd(), 'llm_cache')
+        self.cache_base = CACHE_BASE
+
         self.directoryDict = {
-                'datasets_tokenized_permanent': '/software/ais2t/datasets/huggingface_tokenized',   # Directory for permanent tok. datasets on z1
-                'output': os.path.join(self.tmp_dir, 'output'),  # Directory for model checkpoints, which we redirect to tmp, so they get deleted
+                'output': os.path.join(self.tmp_dir, 'output'),
             }
             
         for dir_name in ['pretrained_models', 'datasets', 'tokenized_datasets']:
@@ -84,15 +84,19 @@ class Runner:
             assert getattr(config, arg, None) is not None, f"Argument {arg} must be specified."
         if config.training_mode == "reconstruct":
             assert config.block_size is not None, "block_size must be specified for training_mode == 'reconstruct'."
+        elif config.prune_method == 'flap':
+            assert config.flap_metric is not None, "flap_metric must be specified for prune_method == 'flap'."
+            assert config.flap_pruning_ratio is not None, "flap_pruning_ratio must be specified for prune_method == 'flap'."
+            assert config.flap_unstr is not None, "flap_unstr must be specified for prune_method == 'flap'."
 
 
-    def get_llm(self, model_name):
+    def get_llm(self, model_name, sweep_id=None):
         torch_dtype = torch.float16 # In the original setup, this was specified as torch.float16
 
         device_map = "auto"
         if self.config.distribute_reconstruction_blocks:
             sys.stdout.write(f"Distributing reconstruction submodels across {torch.cuda.device_count()} GPUs.")
-            assert hasattr(self.model, "hf_device_map"), "model.hf_device_map must be defined."
+            #assert hasattr(self.model, "hf_device_map"), "model.hf_device_map must be defined."
             num_gpus = torch.cuda.device_count()
             model_name = self.config.model
             assert model_name.startswith("meta-llama/Llama-2") or model_name.startswith("meta-llama/Llama-3")\
@@ -124,15 +128,26 @@ class Runner:
             for i in range(n_blocks_map[num_params]):
                 device_map[f"model.layers.{i}"] = gpu_map[i % max(self.config.block_size, 1)].item()
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch_dtype,
-            cache_dir=self.directoryDict['pretrained_models'],
-            low_cpu_mem_usage=True,
-            device_map=device_map,
-            attn_implementation="flash_attention_2",
-            quantization_config=None,
-        )
+        if sweep_id is None:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch_dtype,
+                cache_dir=self.directoryDict['pretrained_models'],
+                low_cpu_mem_usage=True,
+                device_map=device_map,
+                attn_implementation=self.config.attn_implementation or "flash_attention_2",
+                quantization_config=None,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                os.path.join(self.config.checkpointdir, sweep_id, "best_model"),
+                local_files_only=True,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+                device_map=device_map,
+                attn_implementation=self.config.attn_implementation or "flash_attention_2",
+                quantization_config=None,
+            )
 
         if model.config.max_position_embeddings > 4096:
             model.seqlen = 4096
@@ -172,7 +187,6 @@ class Runner:
         """
         sys.stdout.write(f"Loading {dataset_name}.\n")
         assert dataset_name in ['wikitext2', 'c4', 'minipile'], f"Dataset {dataset_name} not supported."
-
         data_path = Caching.get_dataset_root(dataset_name, tokenizer=self.tokenizer, seqlen=self.model.seqlen, cache_base=self.cache_base)
                 
         if dataset_name == 'wikitext2':
@@ -304,11 +318,10 @@ class Runner:
             "report_to": "wandb",  # Enable logging to W&B
             "logging_steps": 100,  # Log every X updates steps
             "logging_first_step": True,    # Log also the first step
-            "include_tokens_per_second": self.config.include_tokens_per_second or False,   # Log the tokens per second, however this increases the overall runtime
 
             # Model Checkpointing
             "output_dir": self.directoryDict['output'],
-            "overwrite_output_dir": True,
+            #"overwrite_output_dir": True,
             "save_strategy": "no", # Do not save the model checkpoints
         }
         try:
@@ -322,7 +335,7 @@ class Runner:
             args=training_args,
             train_dataset=tokenized_datasets["train"],
             eval_dataset=tokenized_datasets["validation"],
-            tokenizer=self.tokenizer,
+            #tokenizer=self.tokenizer,
             data_collator=transformers.DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
         )
 
@@ -366,6 +379,7 @@ class Runner:
             'log_grad_norm': self.config.log_grad_norm,
             'optim': self.config.optim,
             'momentum': self.config.momentum,
+            'frac_skip_rec': float(self.config.frac_skip_rec) if self.config.frac_skip_rec is not None else 0.0,
         }
 
         # Handle n:m sparsity
@@ -386,7 +400,7 @@ class Runner:
         pruneMethod.prune()
         self.pruneMethod = pruneMethod
 
-        if self.config.prune_method == 'flap' and self.config.training_mode == 'reconstruct':
+        if self.config.prune_method in ['flap'] and self.config.training_mode == 'reconstruct':
             args["reconstruct"] = True
             args["training_mode"] = "reconstruct"
             args["reconstruct_n_samples"] = self.config.reconstruct_n_samples
@@ -422,6 +436,70 @@ class Runner:
         return zero_shot_metrics
 
 
+    def get_reasoning_metrics(self):
+        sys.stdout.write("Evaluating reasoning performance.\n")
+        train_state = self.model.training
+        self.change_model_state(train=False)
+
+        # Choose gsm8k or gsm8k_cot depending on what you want to measure
+        task_list = ["humaneval", "gsm8k"]
+
+        results = Utils.eval_reasoning(
+            self.config.model,
+            self.model,
+            task_list,
+            gsm8k_variant="gsm8k",   # or "gsm8k_cot"
+        )["results"]
+
+        metric_values = {}
+        metric_stderrs = {}
+
+        for task in task_list:
+            task_metrics = results[task]
+
+            if task == "humaneval":
+                # humaneval uses pass@1, often under the create_test filter
+                score = Utils._extract_metric(
+                    task_metrics,
+                    "pass@1",
+                    preferred_filters=["create_test"],
+                )
+                stderr = Utils._extract_stderr(
+                    task_metrics,
+                    "pass@1",
+                    preferred_filters=["create_test"],
+                )
+
+            elif task == "gsm8k":
+                # gsm8k uses exact_match; flexible-extract is usually the main one
+                score = Utils._extract_metric(
+                    task_metrics,
+                    "exact_match",
+                    preferred_filters=["flexible-extract", "strict-match"],
+                )
+                stderr = Utils._extract_stderr(
+                    task_metrics,
+                    "exact_match",
+                    preferred_filters=["flexible-extract", "strict-match"],
+                )
+            else:
+                raise ValueError(f"Unsupported reasoning task: {task}")
+
+            metric_values[f"metrics/reasoning_score_{task}"] = score
+            metric_stderrs[f"metrics/reasoning_score_stderr_{task}"] = stderr
+
+        avg_reasoning_score = np.mean(list(metric_values.values()))
+
+        reasoning_metrics = {
+            "metrics/avg_reasoning_score": avg_reasoning_score,
+            **metric_values,
+            **metric_stderrs,
+        }
+
+        self.change_model_state(train=train_state)
+        return reasoning_metrics
+
+
     def run(self):
         # Setting seeds for reproducibility
         random.seed(self.config.seed)
@@ -433,7 +511,7 @@ class Runner:
 
         sys.stdout.write(f"Loading LLM model {self.config['model']}.\n")
         # Load model and tokenizer
-        self.model = self.get_llm(self.config['model'])
+        self.model = self.get_llm(self.config['model'], self.config.checkpoint_sweep_id)
         self.tokenizer = AutoTokenizer.from_pretrained(self.config['model'], use_fast=False)
 
         if self.is_llama or self.is_mistral:
@@ -485,6 +563,19 @@ class Runner:
         if self.config.training_mode == 'retrain' or self.config.training_mode == 'reconstruct':
             self.log_metrics(state='retrained', additional_metrics=additional_metrics)
 
+        if self.config.save_best_model:
+            checkpoint_path = os.path.join(self.config.checkpointdir, self.sweep_id)
+            if not os.path.exists(os.path.join(checkpoint_path, "best_ppl.txt")):
+                os.makedirs(checkpoint_path, exist_ok=True)
+                with open(os.path.join(checkpoint_path, "best_ppl.txt"), "w") as f:
+                    f.write(str(float("inf")))
+            with open(os.path.join(checkpoint_path, "best_ppl.txt"), "r") as f:
+                best_ppl = float(f.read())
+            if self.eval_on_wikitext() < best_ppl:
+                with open(os.path.join(checkpoint_path, "best_ppl.txt"), "w") as f:
+                    f.write(str(self.eval_on_wikitext()))
+                self.model.save_pretrained(os.path.join(checkpoint_path, "best_model"))
+
         # Evaluate zero-shot performance
         if self.config.eval_zero_shot:
             zero_shot_metrics = self.get_zeroshot_metrics(debug=self.debug)
@@ -493,3 +584,12 @@ class Runner:
             for key, val in zero_shot_metrics.items():
                 wandb.run.summary[key] = val
             wandb.log(zero_shot_metrics, commit=True)
+
+        # Evaluate reasoning performance
+        if self.config.eval_reasoning:
+            reasoning_metrics = self.get_reasoning_metrics()
+
+            # Log the metrics to the wandb summary
+            for key, val in reasoning_metrics.items():
+                wandb.run.summary[key] = val
+            wandb.log(reasoning_metrics, commit=True)
