@@ -1,6 +1,6 @@
 ## A Free Lunch in LLM Compression: Revisiting Retraining after Pruning
 
-This repository contains the code to reproduce the experiments from the paper ["A Free Lunch in LLM Compression: Revisiting Retraining after Pruning"](https://arxiv.org/abs/2510.14444).
+This repository contains the code to reproduce the experiments from the paper "A Free Lunch in LLM Compression: Revisiting Retraining after Pruning".
 The code is based on [PyTorch 2.8](https://pytorch.org/) and the experiment-tracking platform [Weights & Biases](https://wandb.ai). The results in the paper were generated using [Python 3.12](https://www.python.org/) and [CUDA 12.8](https://developer.nvidia.com/cuda-12-8-0-download-archive) and the environment defined in [`requirements.txt`](requirements.txt).
 
 ### Usage
