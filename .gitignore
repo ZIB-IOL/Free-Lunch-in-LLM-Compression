@@ -1,0 +1,4 @@
+__pycache__/
+hf_cache/
+llm_cache/
+wandb/
